@@ -11,6 +11,28 @@ const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 
 const log = std.log.scoped(.websocket);
 
+// Windows-compatible socket option constants.
+// std.posix.SOL/SO resolve to empty structs on Windows.
+const SOL_SOCKET: i32 = if (builtin.os.tag == .windows)
+    @intCast(std.os.windows.ws2_32.SOL.SOCKET)
+else
+    posix.SOL.SOCKET;
+
+const SO_RCVTIMEO: u32 = if (builtin.os.tag == .windows)
+    @intCast(std.os.windows.ws2_32.SO.RCVTIMEO)
+else
+    posix.SO.RCVTIMEO;
+
+const SO_SNDTIMEO: u32 = if (builtin.os.tag == .windows)
+    @intCast(std.os.windows.ws2_32.SO.SNDTIMEO)
+else
+    posix.SO.SNDTIMEO;
+
+const SO_REUSEADDR: u32 = if (builtin.os.tag == .windows)
+    @intCast(std.os.windows.ws2_32.SO.REUSEADDR)
+else
+    posix.SO.REUSEADDR;
+
 const OpCode = proto.OpCode;
 const Reader = proto.Reader;
 const Message = proto.Message;
@@ -193,7 +215,7 @@ pub fn Server(comptime H: type) type {
             } else if (@hasDecl(posix.SO, "REUSEPORT")) {
                 try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
             } else {
-                try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+                try posix.setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
             }
 
             {
@@ -379,7 +401,7 @@ pub fn Blocking(comptime H: type) type {
                 errdefer self.cleanupConn(hc);
                 const timeout = self.handshake_timeout;
                 const deadline = timestamp() + timeout.sec;
-                try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &timeout.timeval);
+                try posix.setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout.timeval);
 
                 while (true) {
                     const compression, const ok = handleHandshake(H, self, hc, ctx);
@@ -408,7 +430,7 @@ pub fn Blocking(comptime H: type) type {
         // directly when integrating with an http server
         pub fn readLoop(self: *Self, hc: *HandlerConn(H)) !void {
             defer self.cleanupConn(hc);
-            try posix.setsockopt(hc.socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &Timeout.none);
+            try posix.setsockopt(hc.socket, SOL_SOCKET, SO_RCVTIMEO, &Timeout.none);
 
             // In BlockingMode, we always assign a reader for the duration of the connection
             // In scenarios where client rarely send data, this is going to use up an unecessary amount
@@ -1418,13 +1440,11 @@ pub const Conn = struct {
         var buf: [10]u8 = undefined;
         const header = proto.writeFrameHeader(&buf, op_code, payload.len, compressed);
 
-        const stream = self.stream;
-
         if (payload.len == 0) {
             // no body, just write the header
             self.lock.lock();
             defer self.lock.unlock();
-            return stream.writeAll(header);
+            return sendAll(self.stream.handle, header);
         }
 
         var vec = [2]std.posix.iovec_const{
@@ -1438,7 +1458,26 @@ pub const Conn = struct {
     pub fn writeFramed(self: *Conn, data: []const u8) !void {
         self.lock.lock();
         defer self.lock.unlock();
-        try self.stream.writeAll(data);
+        try sendAll(self.stream.handle, data);
+    }
+
+    /// Windows-safe writeAll: uses send() on Windows instead of stream.writeAll/posix.write
+    /// which use WriteFile and return ERROR_INVALID_PARAMETER on sockets in Zig 0.15.
+    fn sendAll(socket: net.Stream.Handle, data: []const u8) !void {
+        if (builtin.os.tag == .windows) {
+            var sent: usize = 0;
+            while (sent < data.len) {
+                const remaining = data[sent..];
+                const rc = std.os.windows.ws2_32.send(socket, remaining.ptr, @intCast(remaining.len), 0);
+                if (rc == std.os.windows.ws2_32.SOCKET_ERROR) {
+                    return error.BrokenPipe;
+                }
+                sent += @intCast(rc);
+            }
+        } else {
+            const stream = net.Stream{ .handle = socket };
+            try stream.writeAll(data);
+        }
     }
 
     fn writeAllIOVec(self: *Conn, vec: []std.posix.iovec_const) !void {
@@ -1449,7 +1488,16 @@ pub const Conn = struct {
 
         var i: usize = 0;
         while (true) {
-            var n = try std.posix.writev(socket, vec[i..]);
+            var n: usize = if (builtin.os.tag == .windows) blk: {
+                // On Windows, posix.writev uses WriteFile which returns ERROR_INVALID_PARAMETER
+                // on sockets in Zig 0.15. Use send() directly instead.
+                const data = vec[i].base[0..vec[i].len];
+                const rc = std.os.windows.ws2_32.send(socket, data.ptr, @intCast(data.len), 0);
+                if (rc == std.os.windows.ws2_32.SOCKET_ERROR) {
+                    return error.BrokenPipe;
+                }
+                break :blk @intCast(rc);
+            } else try std.posix.writev(socket, vec[i..]);
             while (n >= vec[i].len) {
                 n -= vec[i].len;
                 i += 1;
@@ -1606,8 +1654,8 @@ fn _handleClientData(comptime H: type, hc: *HandlerConn(H), allocator: Allocator
     var reader = &hc.reader.?;
     reader.fill(conn.stream) catch |err| {
         switch (err) {
-            error.BrokenPipe, error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
-            else => log.warn("({f}) error reading from connection: {}", .{ conn.address, err }),
+            error.Closed, error.ConnectionResetByPeer => log.debug("({f}) connection closed: {}", .{ conn.address, err }),
+            else => |e| log.warn("({f}) error reading from connection: {}", .{ conn.address, e }),
         }
         return false;
     };
@@ -1779,11 +1827,16 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
 
     const socket = conn.stream.handle;
     const timeout = std.mem.toBytes(posix.timeval{ .sec = 5, .usec = 0 });
-    posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &timeout) catch return;
+    posix.setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout) catch return;
 
     var pos: usize = 0;
     while (pos < response.len) {
-        const n = posix.write(socket, response[pos..]) catch return;
+        const remaining = response[pos..];
+        const n: usize = if (builtin.os.tag == .windows) blk: {
+            const rc = std.os.windows.ws2_32.send(socket, remaining.ptr, @intCast(remaining.len), 0);
+            if (rc == std.os.windows.ws2_32.SOCKET_ERROR) return;
+            break :blk @intCast(rc);
+        } else posix.write(socket, remaining) catch return;
         if (n == 0) {
             // closed
             return;
@@ -1959,8 +2012,8 @@ fn testStream(handshake: bool) !net.Stream {
     const timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 20_000 });
     const address = try std.net.Address.parseIp("127.0.0.1", 9292);
     const stream = try std.net.tcpConnectToAddress(address);
-    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout);
-    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &timeout);
+    try std.posix.setsockopt(stream.handle, SOL_SOCKET, SO_RCVTIMEO, &timeout);
+    try std.posix.setsockopt(stream.handle, SOL_SOCKET, SO_SNDTIMEO, &timeout);
 
     if (handshake == false) {
         return stream;

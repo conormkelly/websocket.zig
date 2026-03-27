@@ -127,7 +127,23 @@ pub const Reader = struct {
     pub fn fill(self: *Reader, stream: anytype) !void {
         const pos = self.pos;
         std.debug.assert(self.buf.data.len > pos);
-        const n = try stream.read(self.buf.data[pos..]);
+        const dest = self.buf.data[pos..];
+        const n = if (@import("builtin").os.tag == .windows) blk: {
+            // On Windows, net.Stream.read() uses ReadFile which returns ERROR_INVALID_PARAMETER (87)
+            // on sockets in Zig 0.15. Use recv() directly instead.
+            const rc = std.os.windows.ws2_32.recv(stream.handle, dest.ptr, @intCast(dest.len), 0);
+            if (rc == std.os.windows.ws2_32.SOCKET_ERROR) {
+                const err_code = std.os.windows.ws2_32.WSAGetLastError();
+                return switch (err_code) {
+                    .WSAECONNRESET => error.ConnectionResetByPeer,
+                    .WSAECONNABORTED => error.ConnectionResetByPeer,
+                    .WSAETIMEDOUT => error.ConnectionTimedOut,
+                    .WSAENETRESET => error.ConnectionResetByPeer,
+                    else => error.Unexpected,
+                };
+            }
+            break :blk @as(usize, @intCast(rc));
+        } else try stream.read(dest);
         if (n == 0) {
             return error.Closed;
         }
