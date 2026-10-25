@@ -1341,6 +1341,19 @@ pub const Conn = struct {
     lock: Thread.Mutex = .{},
     compression: ?*Conn.Compression = null,
 
+    /// Bytes of already-started frames the socket did not take yet. Sockets
+    /// are non-blocking: when one is full, the rest of the frame waits here
+    /// (and later frames queue behind it) rather than being abandoned
+    /// mid-frame, which would corrupt the stream for good. Drained by later
+    /// writes and by flushPending. Protected by `lock`.
+    pending: std.ArrayListUnmanaged(u8) = .empty,
+    /// Bytes at the front of `pending` already sent.
+    pending_head: usize = 0,
+
+    /// A peer this far behind is not reading; it is disconnected rather than
+    /// queued for without bound.
+    pub const max_pending_bytes: usize = 16 * 1024 * 1024;
+
     const Compression = struct {
         allocator: Allocator,
         retain_writer: bool,
@@ -1442,9 +1455,8 @@ pub const Conn = struct {
 
         if (payload.len == 0) {
             // no body, just write the header
-            self.lock.lock();
-            defer self.lock.unlock();
-            return sendAll(self.stream.handle, header);
+            var vec = [1]std.posix.iovec_const{.{ .len = header.len, .base = header.ptr }};
+            return self.writeAllIOVec(&vec);
         }
 
         var vec = [2]std.posix.iovec_const{
@@ -1456,55 +1468,116 @@ pub const Conn = struct {
     }
 
     pub fn writeFramed(self: *Conn, data: []const u8) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
-        try sendAll(self.stream.handle, data);
+        var vec = [1]std.posix.iovec_const{.{ .len = data.len, .base = data.ptr }};
+        return self.writeAllIOVec(&vec);
     }
 
-    /// Windows-safe writeAll: uses send() on Windows instead of stream.writeAll/posix.write
-    /// which use WriteFile and return ERROR_INVALID_PARAMETER on sockets in Zig 0.15.
-    fn sendAll(socket: net.Stream.Handle, data: []const u8) !void {
-        if (builtin.os.tag == .windows) {
-            var sent: usize = 0;
-            while (sent < data.len) {
-                const remaining = data[sent..];
-                const rc = std.os.windows.ws2_32.send(socket, remaining.ptr, @intCast(remaining.len), 0);
-                if (rc == std.os.windows.ws2_32.SOCKET_ERROR) {
-                    return error.BrokenPipe;
-                }
-                sent += @intCast(rc);
-            }
-        } else {
-            const stream = net.Stream{ .handle = socket };
-            try stream.writeAll(data);
+    /// Send as much of the queued output as the socket takes now. Never
+    /// blocks; call it regularly while hasPendingOutput() (e.g. on a timer).
+    pub fn flushPending(self: *Conn) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.isClosed()) return;
+        try self.flushPendingLocked();
+    }
+
+    /// Whether output is queued behind a full socket.
+    pub fn hasPendingOutput(self: *Conn) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.pendingLen() > 0;
+    }
+
+    fn pendingLen(self: *const Conn) usize {
+        return self.pending.items.len - self.pending_head;
+    }
+
+    fn flushPendingLocked(self: *Conn) !void {
+        while (self.pendingLen() > 0) {
+            const n = sendSome(self.stream.handle, self.pending.items[self.pending_head..]) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return err,
+            };
+            self.pending_head += n;
         }
+        self.pending.clearAndFree(std.heap.smp_allocator);
+        self.pending_head = 0;
     }
 
-    fn writeAllIOVec(self: *Conn, vec: []std.posix.iovec_const) !void {
-        const socket = self.stream.handle;
+    /// One non-blocking send. Windows uses send(): posix.write goes through
+    /// WriteFile, which fails on sockets in Zig 0.15.
+    fn sendSome(socket: net.Stream.Handle, data: []const u8) !usize {
+        if (builtin.os.tag == .windows) {
+            const ws2 = std.os.windows.ws2_32;
+            const rc = ws2.send(socket, data.ptr, @intCast(data.len), 0);
+            if (rc == ws2.SOCKET_ERROR) {
+                return switch (ws2.WSAGetLastError()) {
+                    .WSAEWOULDBLOCK => error.WouldBlock,
+                    else => error.BrokenPipe,
+                };
+            }
+            return @intCast(rc);
+        }
+        return std.posix.write(socket, data);
+    }
 
+    /// Queue what is left of `vec` behind a full socket, or give up on a peer
+    /// that has stopped reading.
+    fn queueLocked(self: *Conn, vec: []const std.posix.iovec_const) !void {
+        var total: usize = self.pendingLen();
+        for (vec) |v| total += v.len;
+        if (total > max_pending_bytes) {
+            // Not reading: end the connection (the worker cleans it up when
+            // its read sees the shutdown) instead of tearing a frame.
+            log.debug("({f}) peer not reading, {d} bytes behind; disconnecting", .{ self.address, total });
+            self.pending.clearAndFree(std.heap.smp_allocator);
+            self.pending_head = 0;
+            posix.shutdown(self.stream.handle, .both) catch {};
+            return error.BrokenPipe;
+        }
+        // Drop what was already sent once it outweighs what is left.
+        if (self.pending_head > 0 and self.pending_head >= self.pendingLen()) {
+            const rest = self.pendingLen();
+            std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[self.pending_head..]);
+            self.pending.shrinkRetainingCapacity(rest);
+            self.pending_head = 0;
+        }
+        try self.pending.ensureUnusedCapacity(std.heap.smp_allocator, total - self.pendingLen());
+        for (vec) |v| self.pending.appendSliceAssumeCapacity(v.base[0..v.len]);
+    }
+
+    /// Write whole frames or queue the rest: a frame is never abandoned
+    /// part-way, since the peer would then read every later byte as part of it.
+    fn writeAllIOVec(self: *Conn, vec: []std.posix.iovec_const) !void {
         self.lock.lock();
         defer self.lock.unlock();
+
+        if (self.pendingLen() > 0) {
+            // Earlier output is still queued: this frame goes behind it.
+            try self.queueLocked(vec);
+            return self.flushPendingLocked();
+        }
 
         var i: usize = 0;
-        while (true) {
-            var n: usize = if (builtin.os.tag == .windows) blk: {
-                // On Windows, posix.writev uses WriteFile which returns ERROR_INVALID_PARAMETER
-                // on sockets in Zig 0.15. Use send() directly instead.
-                const data = vec[i].base[0..vec[i].len];
-                const rc = std.os.windows.ws2_32.send(socket, data.ptr, @intCast(data.len), 0);
-                if (rc == std.os.windows.ws2_32.SOCKET_ERROR) {
-                    return error.BrokenPipe;
+        while (i < vec.len) {
+            var n: usize = if (builtin.os.tag == .windows)
+                sendSome(self.stream.handle, vec[i].base[0..vec[i].len]) catch |err| switch (err) {
+                    error.WouldBlock => return self.queueLocked(vec[i..]),
+                    else => return err,
                 }
-                break :blk @intCast(rc);
-            } else try std.posix.writev(socket, vec[i..]);
-            while (n >= vec[i].len) {
+            else
+                std.posix.writev(self.stream.handle, vec[i..]) catch |err| switch (err) {
+                    error.WouldBlock => return self.queueLocked(vec[i..]),
+                    else => return err,
+                };
+            while (i < vec.len and n >= vec[i].len) {
                 n -= vec[i].len;
                 i += 1;
-                if (i >= vec.len) return;
             }
-            vec[i].base += n;
-            vec[i].len -= n;
+            if (i < vec.len) {
+                vec[i].base += n;
+                vec[i].len -= n;
+            }
         }
     }
 
@@ -1524,6 +1597,10 @@ pub const Conn = struct {
     fn closeSocket(self: *Conn) void {
         if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
             posix.close(self.stream.handle);
+            self.lock.lock();
+            defer self.lock.unlock();
+            self.pending.clearAndFree(std.heap.smp_allocator);
+            self.pending_head = 0;
         }
     }
 
@@ -1974,6 +2051,87 @@ test "Server: dirty clientMessage allocator" {
     var buf: [12]u8 = undefined;
     _ = try stream.readAtLeast(&buf, 12);
     try t.expectSlice(u8, &.{ 129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!' }, buf[0..12]);
+}
+
+fn nonBlockingSmallBuffer(stream: net.Stream) !void {
+    // O_NONBLOCK, not SOCK.NONBLOCK: the latter is a socket() flag, and only
+    // on Linux do the two share a value.
+    const nonblock: usize = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+    const flags = try posix.fcntl(stream.handle, posix.F.GETFL, 0);
+    _ = try posix.fcntl(stream.handle, posix.F.SETFL, flags | nonblock);
+    const sndbuf: c_int = 16 * 1024;
+    try posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sndbuf));
+}
+
+test "Conn: frames written to a full socket arrive whole and in order" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+    defer pair.server.close();
+    try nonBlockingSmallBuffer(pair.server);
+    var conn = Conn{ ._closed = false, .started = 0, .stream = pair.server, .address = undefined };
+    defer conn.pending.deinit(std.heap.smp_allocator);
+
+    // Nobody reads while four 1 MB frames are written: none may fail and
+    // none may be cut short.
+    const payload = try t.allocator.alloc(u8, 1024 * 1024);
+    defer t.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i *% 7);
+    for (0..4) |i| {
+        payload[0] = @intCast(i);
+        try conn.writeBin(payload);
+    }
+    try t.expectEqual(true, conn.hasPendingOutput());
+
+    // The peer starts reading; the writer drains the queue as it goes.
+    const expected_len = 4 * (10 + payload.len);
+    const received = try t.allocator.alloc(u8, expected_len);
+    defer t.allocator.free(received);
+    const PeerReader = struct {
+        fn run(stream: net.Stream, out: []u8) void {
+            _ = stream.readAtLeast(out, out.len) catch unreachable;
+        }
+    };
+    const reader = try std.Thread.spawn(.{}, PeerReader.run, .{ pair.client, received });
+    while (conn.hasPendingOutput()) {
+        try conn.flushPending();
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    reader.join();
+
+    var at: usize = 0;
+    for (0..4) |i| {
+        // 0x82 = final binary frame, 127 = 8-byte length
+        try t.expectEqual(0x82, received[at]);
+        try t.expectEqual(127, received[at + 1]);
+        try t.expectEqual(payload.len, std.mem.readInt(u64, received[at + 2 ..][0..8], .big));
+        try t.expectEqual(@as(u8, @intCast(i)), received[at + 10]);
+        try t.expectSlice(u8, payload[1..], received[at + 11 .. at + 10 + payload.len]);
+        at += 10 + payload.len;
+    }
+}
+
+test "Conn: a peer that stops reading is disconnected, not queued for without bound" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+    defer pair.server.close();
+    try nonBlockingSmallBuffer(pair.server);
+    var conn = Conn{ ._closed = false, .started = 0, .stream = pair.server, .address = try net.Address.parseIp("127.0.0.1", 0) };
+    defer conn.pending.deinit(std.heap.smp_allocator);
+
+    const payload = try t.allocator.alloc(u8, 1024 * 1024);
+    defer t.allocator.free(payload);
+    @memset(payload, 'x');
+    var failed = false;
+    for (0..(Conn.max_pending_bytes / payload.len) + 4) |_| {
+        conn.writeBin(payload) catch {
+            failed = true;
+            break;
+        };
+    }
+    try t.expectEqual(true, failed);
+    try t.expectEqual(false, conn.hasPendingOutput());
 }
 
 test "Conn: close" {
