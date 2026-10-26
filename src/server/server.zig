@@ -28,6 +28,16 @@ const SO_SNDTIMEO: u32 = if (builtin.os.tag == .windows)
 else
     posix.SO.SNDTIMEO;
 
+// SO_RCVTIMEO/SO_SNDTIMEO's value: a timeval, except on Windows, where it's
+// a DWORD of milliseconds (a timeval there reads as its seconds field in
+// milliseconds: 5 s would be 5 ms). 0 means no timeout.
+const SocketTimeout = if (builtin.os.tag == .windows) [4]u8 else [@sizeOf(posix.timeval)]u8;
+
+fn socketTimeout(sec: u32) SocketTimeout {
+    if (builtin.os.tag == .windows) return std.mem.toBytes(@as(u32, sec *| 1000));
+    return std.mem.toBytes(posix.timeval{ .sec = @intCast(sec), .usec = 0 });
+}
+
 const SO_REUSEADDR: u32 = if (builtin.os.tag == .windows)
     @intCast(std.os.windows.ws2_32.SO.REUSEADDR)
 else
@@ -324,17 +334,16 @@ pub fn Blocking(comptime H: type) type {
 
         const Timeout = struct {
             sec: u32,
-            timeval: [@sizeOf(std.posix.timeval)]u8,
+            timeval: SocketTimeout,
 
-            // if sec is null, it means we want to cancel the timeout.
             fn init(sec: u32) Timeout {
                 return .{
                     .sec = sec,
-                    .timeval = std.mem.toBytes(posix.timeval{ .sec = @intCast(sec), .usec = 0 }),
+                    .timeval = socketTimeout(sec),
                 };
             }
 
-            pub const none = std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 0 });
+            pub const none = socketTimeout(0);
         };
 
         const Self = @This();
@@ -465,9 +474,16 @@ pub fn Blocking(comptime H: type) type {
             }
         }
 
-        // called for each hc when shutting down
+        // called for each hc when shutting down, to end its blocked readLoop.
+        // Windows only wakes a blocked recv by closing the socket (shutdown
+        // doesn't); closeSocket is idempotent, so readLoop's own close after
+        // waking is harmless. Elsewhere shutdown wakes it and readLoop closes.
         fn shutdownCleanup(_: *Self, hc: *HandlerConn(H)) void {
-            posix.shutdown(hc.socket, .recv) catch {};
+            if (builtin.os.tag == .windows) {
+                hc.conn.closeSocket();
+            } else {
+                posix.shutdown(hc.socket, .recv) catch {};
+            }
         }
     };
 }
@@ -1903,7 +1919,7 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
     }
 
     const socket = conn.stream.handle;
-    const timeout = std.mem.toBytes(posix.timeval{ .sec = 5, .usec = 0 });
+    const timeout = socketTimeout(5);
     posix.setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout) catch return;
 
     var pos: usize = 0;
