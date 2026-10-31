@@ -144,6 +144,8 @@ pub fn Server(comptime H: type) type {
         /// Blocking mode: the running worker's stop signal, which stop()
         /// sets. Guarded by _mut.
         _stop: ?*socket_wait.Stop = null,
+        /// listen is serving; stop() waits until it isn't. Guarded by _mut.
+        _running: bool = false,
         _mut: Thread.Mutex,
         _cond: Thread.Condition,
 
@@ -266,6 +268,7 @@ pub fn Server(comptime H: type) type {
 
                 // this is what stop() signals
                 self._stop = &w.stop;
+                self._running = true;
                 self._mut.unlock();
                 thrd.join();
                 self._mut.lock();
@@ -315,18 +318,25 @@ pub fn Server(comptime H: type) type {
                 // in case startInNewThread is waiting
                 self._cond.signal();
 
+                self._running = true;
                 self._mut.unlock();
 
                 for (threads) |thrd| {
                     thrd.join();
                 }
             }
-            self._cond.signal();
+            self._mut.lock();
+            defer self._mut.unlock();
+            self._running = false;
+            self._cond.broadcast();
         }
 
+        /// Returns once listen has stopped serving (at once if it isn't:
+        /// its worker may have ended on an error).
         pub fn stop(self: *Self) void {
             self._mut.lock();
             defer self._mut.unlock();
+            if (!self._running) return;
             if (comptime blockingMode()) {
                 // The worker's accept loop and connections wait on this;
                 // run closes the listener once they are done.
@@ -334,7 +344,7 @@ pub fn Server(comptime H: type) type {
             } else {
                 for (self._signals) |s| posix.close(s);
             }
-            self._cond.wait(&self._mut);
+            while (self._running) self._cond.wait(&self._mut);
         }
     };
 }
@@ -419,9 +429,22 @@ pub fn Blocking(comptime H: type) type {
                     },
                     // A client that went away before we got to it.
                     error.ConnectionAborted, error.ConnectionResetByPeer => continue,
-                    else => {
+                    error.SocketNotListening => {
                         log.err("failed to accept socket: {}", .{err});
                         return;
+                    },
+                    else => {
+                        // Out of descriptors or buffers, say: likely to
+                        // pass, so try again shortly (or stop).
+                        log.err("failed to accept socket: {}", .{err});
+                        waiter.wait(listener, &self.stop, 100) catch |wait_err| switch (wait_err) {
+                            error.Timeout => {},
+                            else => {
+                                log.err("failed to wait for connections: {}", .{wait_err});
+                                return;
+                            },
+                        };
+                        continue;
                     },
                 };
                 log.debug("({f}) connected", .{address});
@@ -1252,13 +1275,17 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         }
 
         pub fn create(self: *Self, socket: posix.socket_t, address: net.Address, now: u32) !*HandlerConn(H) {
-            errdefer closeSocketHandle(socket);
-
             // Blocking mode: the socket is non-blocking from here on.
             var blocking: Conn.BlockingState = if (comptime blockingMode()) .{
-                .waiter = try socket_wait.Waiter.init(socket, .read),
+                .waiter = socket_wait.Waiter.init(socket, .read) catch |err| {
+                    closeSocketHandle(socket);
+                    return err;
+                },
             } else {};
+            // The socket first, then its event (closesocket ends the
+            // socket's use of it).
             errdefer if (comptime blockingMode()) blocking.waiter.deinit();
+            errdefer closeSocketHandle(socket);
 
             self.lock.lock();
             defer self.lock.unlock();
@@ -1623,6 +1650,7 @@ pub const Conn = struct {
     }
 
     fn flushPendingLocked(self: *Conn) !void {
+        if (comptime blockingMode()) std.debug.assert(!self.blocking.released);
         while (self.pendingLen() > 0) {
             const n = sendSome(self.stream.handle, self.pending.items[self.pending_head..]) catch |err| switch (err) {
                 error.WouldBlock => return,
@@ -1706,6 +1734,7 @@ pub const Conn = struct {
     }
 
     fn sendAllLocked(self: *Conn, vec: []std.posix.iovec_const) !void {
+        if (comptime blockingMode()) std.debug.assert(!self.blocking.released);
 
         if (self.pendingLen() > 0) {
             // Earlier output is still queued: this frame goes behind it.
@@ -2643,9 +2672,6 @@ fn expectList(expected: []const i32, list: List(TestNode)) !void {
     try t.expectEqual(0, i);
 }
 
-// Shutdown can land after an upgrade's last stopping check and before its
-// thread reaches readLoop. readLoop must then end the connection at once:
-// nothing would wake a recv that starts after shutdown has run.
 // Blocking-mode tests: a connection as httpz drives one (Worker.createConn,
 // then readLoop on the connection's own thread).
 const BlockingTest = struct {
