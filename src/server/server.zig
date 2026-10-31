@@ -2156,7 +2156,7 @@ test "Server: invalid handshake" {
     var buf: [1024]u8 = undefined;
     var pos: usize = 0;
     while (pos < buf.len) {
-        const n = try stream.read(buf[0..]);
+        const n = try testRecv(stream, buf[0..]);
         if (n == 0) {
             break;
         }
@@ -2174,7 +2174,7 @@ test "Server: read and write" {
 
     try stream.writeAll(&proto.frame(.text, "over"));
     var buf: [12]u8 = undefined;
-    _ = try stream.readAtLeast(&buf, 6);
+    _ = try testRecvAtLeast(stream, &buf, 6);
     try t.expectSlice(u8, &.{ 129, 4, '9', '0', '0', '0' }, buf[0..6]);
 }
 
@@ -2184,7 +2184,7 @@ test "Server: clientMessage allocator" {
 
     try stream.writeAll(&proto.frame(.text, "dyn"));
     var buf: [12]u8 = undefined;
-    _ = try stream.readAtLeast(&buf, 12);
+    _ = try testRecvAtLeast(stream, &buf, 12);
     try t.expectSlice(u8, &.{ 129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!' }, buf[0..12]);
 }
 
@@ -2194,7 +2194,7 @@ test "Server: clientMessage writer" {
 
     try stream.writeAll(&proto.frame(.text, "writer"));
     var buf: [9]u8 = undefined;
-    _ = try stream.readAtLeast(&buf, 9);
+    _ = try testRecvAtLeast(stream, &buf, 9);
     try t.expectSlice(u8, &.{ 129, 7, '9', '0', '0', '0', '!', '!', '!' }, buf[0..9]);
 }
 
@@ -2205,7 +2205,7 @@ test "Server: dirty clientMessage allocator" {
 
     try stream.writeAll(&proto.frame(.text, "dyn"));
     var buf: [12]u8 = undefined;
-    _ = try stream.readAtLeast(&buf, 12);
+    _ = try testRecvAtLeast(stream, &buf, 12);
     try t.expectSlice(u8, &.{ 129, 10, 'o', 'v', 'e', 'r', ' ', '9', '0', '0', '0', '!' }, buf[0..12]);
 }
 
@@ -2297,7 +2297,7 @@ test "Conn: close" {
         defer stream.close();
         try stream.writeAll(&proto.frame(.text, "close1"));
         var buf: [4]u8 = undefined;
-        _ = try stream.readAtLeast(&buf, 4);
+        _ = try testRecvAtLeast(stream, &buf, 4);
         try t.expectSlice(u8, &.{ 136, 2, 3, 232 }, buf[0..4]);
     }
 
@@ -2307,7 +2307,7 @@ test "Conn: close" {
         defer stream.close();
         try stream.writeAll(&proto.frame(.text, "close2"));
         var buf: [4]u8 = undefined;
-        _ = try stream.readAtLeast(&buf, 4);
+        _ = try testRecvAtLeast(stream, &buf, 4);
         try t.expectSlice(u8, &.{ 136, 2, 0, 0x7b }, buf[0..4]);
     }
 
@@ -2317,13 +2317,33 @@ test "Conn: close" {
         defer stream.close();
         try stream.writeAll(&proto.frame(.text, "close3"));
         var buf: [7]u8 = undefined;
-        _ = try stream.readAtLeast(&buf, 7);
+        _ = try testRecvAtLeast(stream, &buf, 7);
         try t.expectSlice(u8, &.{ 136, 5, 0, 0xea, 'b', 'y', 'e' }, buf[0..7]);
     }
 }
 
+// The test client's reads: net.Stream.read is ReadFile on Windows in Zig 0.15,
+// which fails on sockets; recv doesn't.
+fn testRecv(stream: net.Stream, buf: []u8) !usize {
+    return posix.recv(stream.handle, buf, 0);
+}
+
+fn testRecvAtLeast(stream: net.Stream, buf: []u8, len: usize) !usize {
+    var pos: usize = 0;
+    while (pos < len) {
+        const n = try testRecv(stream, buf[pos..]);
+        if (n == 0) return error.EndOfStream;
+        pos += n;
+    }
+    return pos;
+}
+
 fn testStream(handshake: bool) !net.Stream {
-    const timeout = std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 20_000 });
+    // 20 ms: a timeval, except on Windows, where it's a DWORD of milliseconds.
+    const timeout = if (builtin.os.tag == .windows)
+        std.mem.toBytes(@as(u32, 20))
+    else
+        std.mem.toBytes(std.posix.timeval{ .sec = 0, .usec = 20_000 });
     const address = try std.net.Address.parseIp("127.0.0.1", 9292);
     const stream = try std.net.tcpConnectToAddress(address);
     try std.posix.setsockopt(stream.handle, SOL_SOCKET, SO_RCVTIMEO, &timeout);
@@ -2337,7 +2357,7 @@ fn testStream(handshake: bool) !net.Stream {
     var buf: [1024]u8 = undefined;
     var pos: usize = 0;
     while (pos < buf.len) {
-        const n = try stream.read(buf[0..]);
+        const n = try testRecv(stream, buf[0..]);
         if (n == 0) break;
 
         pos += n;
