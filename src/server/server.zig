@@ -412,6 +412,14 @@ pub fn Blocking(comptime H: type) type {
                 const deadline = timestamp() + timeout.sec;
                 try posix.setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout.timeval);
 
+                // Shutdown may wake the handshake's reads (see beginWait).
+                // Every way out below but the break frees hc, so endWait is
+                // called after the loop, not deferred.
+                if (hc.conn.beginWait() == false) {
+                    self.cleanupConn(hc);
+                    return;
+                }
+
                 while (true) {
                     const compression, const ok = handleHandshake(H, self, hc, ctx);
                     if (ok == false) {
@@ -430,6 +438,7 @@ pub fn Blocking(comptime H: type) type {
                         return;
                     }
                 }
+                hc.conn.endWait();
             }
 
             return self.readLoop(hc);
@@ -448,14 +457,28 @@ pub fn Blocking(comptime H: type) type {
             defer self.allocator.free(reader_buf);
 
             hc.reader = Reader.init(reader_buf, self.buffer_provider, hc.compression);
+
+            // From here shutdown may wake this thread (see beginWait); before
+            // here it leaves the socket alone, so neither the setsockopt above
+            // nor an upgrade's reply written before readLoop (through
+            // net.Stream, whose Windows send treats a closed socket as
+            // unreachable) can meet a closed one.
+            if (hc.conn.beginWait() == false) return;
             while (true) {
                 if (handleClientData(H, hc, self.allocator, undefined) == false) {
                     break;
                 }
+                // A peer that keeps sending would otherwise keep the
+                // connection open after shutdown has asked it to end.
+                if (hc.conn.stopRequested()) break;
             }
         }
 
+        // The handler first: until its close() runs, the application may
+        // still write to the conn from other threads (a broadcaster), and
+        // once the socket is closed its descriptor can be reused by another.
         fn cleanupConn(self: *Self, hc: *HandlerConn(H)) void {
+            self.conn_manager.closeHandler(hc);
             hc.conn.closeSocket();
             self.conn_manager.cleanup(hc);
         }
@@ -474,16 +497,14 @@ pub fn Blocking(comptime H: type) type {
             }
         }
 
-        // called for each hc when shutting down, to end its blocked readLoop.
-        // Windows only wakes a blocked recv by closing the socket (shutdown
-        // doesn't); closeSocket is idempotent, so readLoop's own close after
-        // waking is harmless. Elsewhere shutdown wakes it and readLoop closes.
+        // called for each hc when shutting down, to end its connection. The
+        // connection's own thread owns hc.handler and the socket: it may be
+        // inside the handler right now, and it closes both once its
+        // connection ends (readLoop's or the upgrade's cleanupConn). This
+        // only wakes it, if it is waiting in a read, or tells it to stop
+        // before its next one.
         fn shutdownCleanup(_: *Self, hc: *HandlerConn(H)) void {
-            if (builtin.os.tag == .windows) {
-                hc.conn.closeSocket();
-            } else {
-                posix.shutdown(hc.socket, .recv) catch {};
-            }
+            hc.conn.wakeForShutdown();
         }
     };
 }
@@ -839,16 +860,29 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
             self.conn_manager.shutdown(self);
         }
 
-        // called for each hc when shutting down
+        // called for each hc when shutting down: closes its handler and its
+        // socket. Under hc.cleanup, so not while ConnManager.cleanup is
+        // closing the handler, nor while a standalone NonBlocking worker's
+        // pool thread is in it (its dataAvailable holds hc.cleanup). httpz
+        // runs handlers without hc.cleanup, and stops its pool before this.
         fn shutdownCleanup(self: *Self, hc: *HandlerConn(H)) void {
-            hc.cleanup.lock();
-            defer hc.cleanup.unlock();
-            if (hc.reader) |*reader| {
-                if (self.small_buffer_pool == null) {
-                    self.allocator.free(reader.static);
+            {
+                hc.cleanup.lock();
+                defer hc.cleanup.unlock();
+                if (hc.handler) |*h| {
+                    if (comptime std.meta.hasFn(H, "close")) {
+                        h.close();
+                    }
+                    hc.handler = null;
                 }
-                hc.reader = null;
+                if (hc.reader) |*reader| {
+                    if (self.small_buffer_pool == null) {
+                        self.allocator.free(reader.static);
+                    }
+                    hc.reader = null;
+                }
             }
+            hc.conn.closeSocket();
         }
     };
 }
@@ -1253,6 +1287,22 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
             self.pending.insert(hc);
         }
 
+        /// Closes the connection's handler, if it is still open. A NonBlocking
+        /// shutdownCleanup closes it from the event-loop thread: hc.cleanup
+        /// makes one of the two do it, and neither while the other is still
+        /// in it. Not called under self.lock, which shutdown holds while
+        /// taking hc.cleanup.
+        pub fn closeHandler(_: *Self, hc: *HandlerConn(H)) void {
+            hc.cleanup.lock();
+            defer hc.cleanup.unlock();
+            if (hc.handler) |*h| {
+                if (comptime std.meta.hasFn(H, "close")) {
+                    h.close();
+                }
+                hc.handler = null;
+            }
+        }
+
         pub fn cleanup(self: *Self, hc: *HandlerConn(H)) void {
             if (hc.handshake) |h| {
                 h.release();
@@ -1262,12 +1312,7 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
                 r.deinit();
             }
 
-            if (hc.handler) |*h| {
-                if (comptime std.meta.hasFn(H, "close")) {
-                    h.close();
-                }
-                hc.handler = null;
-            }
+            self.closeHandler(hc);
 
             if (hc.conn.compression) |c| {
                 c.writer.deinit();
@@ -1327,21 +1372,13 @@ pub fn ConnManager(comptime H: type, comptime MANAGE_HS: bool) type {
         // but that does a bunch of things we don't need if we know that we're
         // shutting down - like returning data to the pools, and popping items
         // out of the list.
+        // Ending a connection is the worker's (shutdownCleanup): in Blocking
+        // mode its own thread may be using the handler and the socket, so
+        // neither can be closed here.
         fn shutdownList(head: ?*HandlerConn(H), worker: anytype) void {
             var next_node = head;
             while (next_node) |hc| {
-                if (comptime std.meta.hasFn(H, "close")) {
-                    hc.cleanup.lock();
-                    defer hc.cleanup.unlock();
-                    if (hc.handler) |*h| {
-                        h.close();
-                        hc.handler = null;
-                    }
-                }
-
                 worker.shutdownCleanup(hc);
-                const conn = &hc.conn;
-                conn.closeSocket();
                 next_node = hc.next;
             }
         }
@@ -1355,6 +1392,17 @@ pub const Conn = struct {
     stream: net.Stream,
     address: net.Address,
     lock: Thread.Mutex = .{},
+    /// Orders closing the socket against shutting it down, or waking its
+    /// reader, from another thread: on a closed socket those fail with EBADF
+    /// (unreachable in posix.shutdown), and on a reused descriptor they would
+    /// end someone else's connection. Never held across a send or recv;
+    /// `lock` is, by a writer blocked in send, so it can't serve for this.
+    socket_lock: Thread.Mutex = .{},
+    /// Blocking mode: the connection's thread is in a stretch where it may be
+    /// woken by closing (Windows) or shutting down its socket, and shutdown
+    /// has asked it to stop. Guarded by socket_lock.
+    _waiting: bool = false,
+    _stop_requested: bool = false,
     compression: ?*Conn.Compression = null,
 
     /// Bytes of already-started frames the socket did not take yet. Sockets
@@ -1548,7 +1596,7 @@ pub const Conn = struct {
             log.debug("({f}) peer not reading, {d} bytes behind; disconnecting", .{ self.address, total });
             self.pending.clearAndFree(std.heap.smp_allocator);
             self.pending_head = 0;
-            posix.shutdown(self.stream.handle, .both) catch {};
+            self.shutdownSocket(.both);
             return error.BrokenPipe;
         }
         // Drop what was already sent once it outweighs what is left.
@@ -1567,6 +1615,10 @@ pub const Conn = struct {
     fn writeAllIOVec(self: *Conn, vec: []std.posix.iovec_const) !void {
         self.lock.lock();
         defer self.lock.unlock();
+
+        // Its descriptor may already belong to another socket: only a send
+        // that started before the close can still reach it.
+        if (self.isClosed()) return error.Closed;
 
         if (self.pendingLen() > 0) {
             // Earlier output is still queued: this frame goes behind it.
@@ -1611,13 +1663,85 @@ pub const Conn = struct {
     }
 
     fn closeSocket(self: *Conn) void {
-        if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic) == false) {
-            posix.close(self.stream.handle);
-            self.lock.lock();
-            defer self.lock.unlock();
-            self.pending.clearAndFree(std.heap.smp_allocator);
-            self.pending_head = 0;
-        }
+        const closed_here = blk: {
+            self.socket_lock.lock();
+            defer self.socket_lock.unlock();
+            break :blk self.closeLocked();
+        };
+        if (closed_here) self.dropPending();
+    }
+
+    /// Under socket_lock. True if this call closed the socket.
+    fn closeLocked(self: *Conn) bool {
+        if (@atomicRmw(bool, &self._closed, .Xchg, true, .monotonic)) return false;
+        posix.close(self.stream.handle);
+        return true;
+    }
+
+    /// Once the socket is closed: output still queued for it can't be sent.
+    fn dropPending(self: *Conn) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.pending.clearAndFree(std.heap.smp_allocator);
+        self.pending_head = 0;
+    }
+
+    /// Blocking mode, on the connection's thread: from now until endWait (or
+    /// the connection's end), shutdown may wake it. The stretch covers a
+    /// standalone server's whole handshake and all of readLoop, handler
+    /// callbacks included. Windows only wakes a blocked recv by closing the
+    /// socket, so in it the thread must use the socket only through this
+    /// Conn, whose reads and writes report a closed socket as an error:
+    /// net.Stream's Windows send and posix.shutdown treat one as unreachable.
+    /// Outside the stretch nothing wakes the thread, so it must not block
+    /// there on the peer (a large send to a stalled one, say). False if
+    /// shutdown has already asked the connection to stop: the thread ends it
+    /// instead.
+    fn beginWait(self: *Conn) bool {
+        self.socket_lock.lock();
+        defer self.socket_lock.unlock();
+        if (self._stop_requested) return false;
+        self._waiting = true;
+        return true;
+    }
+
+    fn endWait(self: *Conn) void {
+        self.socket_lock.lock();
+        defer self.socket_lock.unlock();
+        self._waiting = false;
+    }
+
+    /// Blocking-mode shutdown: wakes the connection's thread if it is in its
+    /// wait stretch (see beginWait), by closing the socket on Windows and by
+    /// shutting it down elsewhere, both ways so a blocked send wakes too; the
+    /// thread then closes it itself. Otherwise the thread sees the request at
+    /// its next beginWait, or after the message it is handling.
+    fn wakeForShutdown(self: *Conn) void {
+        const closed_here = blk: {
+            self.socket_lock.lock();
+            defer self.socket_lock.unlock();
+            self._stop_requested = true;
+            if (self._waiting == false) break :blk false;
+            if (builtin.os.tag == .windows) break :blk self.closeLocked();
+            if (self.isClosed() == false) posix.shutdown(self.stream.handle, .both) catch {};
+            break :blk false;
+        };
+        if (closed_here) self.dropPending();
+    }
+
+    /// Blocking mode: whether shutdown has asked the connection to end.
+    fn stopRequested(self: *Conn) bool {
+        self.socket_lock.lock();
+        defer self.socket_lock.unlock();
+        return self._stop_requested;
+    }
+
+    /// Shuts the socket down unless it has been closed.
+    fn shutdownSocket(self: *Conn, how: posix.ShutdownHow) void {
+        self.socket_lock.lock();
+        defer self.socket_lock.unlock();
+        if (self.isClosed()) return;
+        posix.shutdown(self.stream.handle, how) catch {};
     }
 
     pub const Writer = struct {
@@ -1908,9 +2032,10 @@ fn buildError(comptime status: u16, comptime err: []const u8) []const u8 {
 
 fn preHandOffWrite(conn: *Conn, response: []const u8) void {
     // "preHandOff" means we haven't given the application handler a reference
-    // to *Conn yet. In theory, this means we don't need to worry about thread-safety
-    // However, it is possible for the worker to be stopped while we're doing this
-    // which causes issues unless we lock
+    // to *Conn yet, so no other thread writes to it. Shutdown can still close
+    // the socket (on Windows, in the handshake's wait stretch): isClosed below
+    // narrows that, and the sends return on an error rather than treat a
+    // closed socket as unreachable.
     conn.lock.lock();
     defer conn.lock.unlock();
 
@@ -2324,4 +2449,48 @@ fn expectList(expected: []const i32, list: List(TestNode)) !void {
         prev = node.prev;
     }
     try t.expectEqual(0, i);
+}
+
+// Shutdown can land after an upgrade's last stopping check and before its
+// thread reaches readLoop. readLoop must then end the connection at once:
+// nothing would wake a recv that starts after shutdown has run.
+test "Blocking: readLoop ends a connection that shutdown asked to stop before it began" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const H = struct {
+        closes: *u32,
+        pub fn clientMessage(_: *@This(), _: []const u8) !void {}
+        pub fn close(self: *@This()) void {
+            self.closes.* += 1;
+        }
+    };
+
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit(); // closes the client; readLoop closes the server side
+
+    var state = try WorkerState.init(t.allocator, .{});
+    defer state.deinit();
+    var worker = try Blocking(H).init(t.allocator, &state);
+    defer worker.deinit();
+
+    var closes: u32 = 0;
+    const hc = try worker.conn_manager.create(pair.server.handle, try net.Address.parseIp("127.0.0.1", 0), 0);
+    hc.handler = .{ .closes = &closes };
+
+    worker.conn_manager.shutdown(&worker);
+
+    var done = std.Thread.ResetEvent{};
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(w: *Blocking(H), c: *HandlerConn(H), d: *std.Thread.ResetEvent) void {
+            w.readLoop(c) catch {};
+            d.set();
+        }
+    }.run, .{ &worker, hc, &done });
+    done.timedWait(2 * std.time.ns_per_s) catch {
+        // It is blocked reading: wake it, then fail.
+        posix.shutdown(pair.client.handle, .both) catch {};
+        thread.join();
+        return error.ReadLoopWaitedAfterShutdown;
+    };
+    thread.join();
+    try t.expectEqual(1, closes);
 }
