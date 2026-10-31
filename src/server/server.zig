@@ -1846,7 +1846,7 @@ fn _handleHandshake(comptime H: type, worker: anytype, hc: *HandlerConn(H), ctx:
 
     const handler = H.init(&handshake, conn, ctx) catch |err| {
         if (comptime std.meta.hasFn(H, "handshakeErrorResponse")) {
-            preHandOffWrite(H.handshakeErrorResponse(err));
+            preHandOffWrite(conn, H.handshakeErrorResponse(err));
         } else {
             respondToHandshakeError(conn, err);
         }
@@ -2320,6 +2320,39 @@ test "Conn: close" {
         _ = try testRecvAtLeast(stream, &buf, 7);
         try t.expectSlice(u8, &.{ 136, 5, 0, 0xea, 'b', 'y', 'e' }, buf[0..7]);
     }
+}
+
+test "Server: a handler's handshakeErrorResponse is what a refused upgrade gets" {
+    const H = struct {
+        pub fn init(_: *const Handshake, _: *Conn, _: void) !@This() {
+            return error.Refused;
+        }
+        pub fn handshakeErrorResponse(err: anyerror) []const u8 {
+            std.debug.assert(err == error.Refused);
+            return "HTTP/1.1 403 \r\nConnection: Close\r\nContent-Length: 0\r\n\r\n";
+        }
+        pub fn clientMessage(_: *@This(), _: []const u8) !void {}
+    };
+    var server = try Server(H).init(t.allocator, .{ .port = 9293, .address = "127.0.0.1" });
+    defer server.deinit();
+    const thread = try server.listenInNewThread({});
+    defer {
+        server.stop();
+        thread.join();
+    }
+
+    const address = try std.net.Address.parseIp("127.0.0.1", 9293);
+    const stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+    try stream.writeAll("GET / HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n");
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+    while (pos < buf.len) {
+        const n = try testRecv(stream, buf[pos..]);
+        if (n == 0) break;
+        pos += n;
+    }
+    try t.expectString("HTTP/1.1 403 \r\nConnection: Close\r\nContent-Length: 0\r\n\r\n", buf[0..pos]);
 }
 
 // The test client's reads: net.Stream.read is ReadFile on Windows in Zig 0.15,
