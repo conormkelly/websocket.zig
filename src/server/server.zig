@@ -43,6 +43,17 @@ const SO_REUSEADDR: u32 = if (builtin.os.tag == .windows)
 else
     posix.SO.REUSEADDR;
 
+/// Closes a socket. On Windows that is closesocket: posix.close there is
+/// CloseHandle, which Microsoft says must not be used on a socket (it skips
+/// Winsock's own cleanup, SO_LINGER included).
+fn closeSocketHandle(socket: posix.socket_t) void {
+    if (builtin.os.tag == .windows) {
+        std.os.windows.closesocket(socket) catch {};
+    } else {
+        posix.close(socket);
+    }
+}
+
 const OpCode = proto.OpCode;
 const Reader = proto.Reader;
 const Message = proto.Message;
@@ -308,13 +319,17 @@ pub fn Server(comptime H: type) type {
             self._mut.lock();
             defer self._mut.unlock();
             for (self._signals) |s| {
-                if (blockingMode()) {
-                    // necessary to unblock accept on linux
-                    // (which might not be that necessary since, on Linux,
-                    // NonBlocking should be used)
-                    posix.shutdown(s, .recv) catch {};
+                if (comptime blockingMode()) {
+                    // s is the listening socket. Closing it ends the accept
+                    // loop; on Linux, accept also needs it shut down (which
+                    // might not be that necessary since, on Linux,
+                    // NonBlocking should be used).
+                    const listener: posix.socket_t = if (builtin.os.tag == .windows) @ptrCast(s) else s;
+                    if (builtin.os.tag != .windows) posix.shutdown(listener, .recv) catch {};
+                    closeSocketHandle(listener);
+                } else {
+                    posix.close(s);
                 }
-                posix.close(s);
             }
             self._cond.wait(&self._mut);
         }

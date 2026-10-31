@@ -2,6 +2,7 @@ const std = @import("std");
 const proto = @import("proto.zig");
 
 const posix = std.posix;
+const builtin = @import("builtin");
 const ArrayList = std.ArrayList;
 
 const Message = proto.Message;
@@ -157,7 +158,9 @@ pub const SocketPair = struct {
         var address_len = address.getOsSockLen();
 
         const listener = posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
-        defer posix.close(listener);
+        defer if (builtin.os.tag == .windows) {
+            std.os.windows.closesocket(listener) catch {};
+        } else posix.close(listener);
 
         {
             // setup our listener
@@ -167,7 +170,11 @@ pub const SocketPair = struct {
         }
 
         const client = posix.socket(address.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch unreachable;
-        {
+        if (builtin.os.tag == .windows) {
+            // The listen backlog completes the connection before accept, so
+            // a blocking connect returns (Windows has no fcntl).
+            posix.connect(client, &address.any, address_len) catch unreachable;
+        } else {
             // connect the client
             const flags = posix.fcntl(client, posix.F.GETFL, 0) catch unreachable;
             _ = posix.fcntl(client, posix.F.SETFL, flags | posix.SOCK.NONBLOCK) catch unreachable;
