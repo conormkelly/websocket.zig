@@ -50,25 +50,36 @@ const SendError = error{
     Unexpected,
 };
 
+/// setsockopt on a connection's socket. Darwin fails any setsockopt on a
+/// socket its peer has already reset (one shut down both ways) with EINVAL,
+/// which posix.setsockopt treats as unreachable: a client resetting at the
+/// wrong moment would panic the process. Here that is
+/// error.ConnectionResetByPeer, and EBADF and ENOTSOCK are errors too.
+/// Windows goes through posix.setsockopt, which has no such case.
+fn setConnectionOption(socket: posix.socket_t, level: i32, name: u32, value: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return posix.setsockopt(socket, level, name, value);
+    switch (posix.errno(posix.system.setsockopt(socket, level, name, value.ptr, @intCast(value.len)))) {
+        .SUCCESS => {},
+        .INVAL => return error.ConnectionResetByPeer,
+        .BADF => return error.NotOpenForWriting,
+        .NOTSOCK => return error.FileDescriptorNotASocket,
+        .NOMEM, .NOBUFS => return error.SystemResources,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
 /// Darwin: a write to a dead peer on this socket fails with EPIPE instead of
 /// raising SIGPIPE, whatever call makes it. Conn's sends already pass
 /// MSG_NOSIGNAL; this also covers any write that doesn't, and kernels that
 /// ignore the flag. Best effort for the same reason. Other systems have no
 /// such option (Linux) or no SIGPIPE (Windows).
-///
-/// Not posix.setsockopt: Darwin fails any setsockopt on a socket whose peer
-/// has already reset it with EINVAL, which posix.setsockopt treats as
-/// unreachable. A client can do that before its connection is accepted.
 fn suppressSigpipe(socket: posix.socket_t) void {
     if (comptime !builtin.os.tag.isDarwin()) return;
-    const one: c_int = 1;
-    const rc = posix.system.setsockopt(socket, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
-    switch (posix.errno(rc)) {
-        .SUCCESS => {},
+    setConnectionOption(socket, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&@as(c_int, 1))) catch |err| switch (err) {
         // Already reset: the next read ends the connection.
-        .INVAL => {},
-        else => |err| log.warn("failed to set SO_NOSIGPIPE: {}", .{err}),
-    }
+        error.ConnectionResetByPeer => {},
+        else => log.warn("failed to set SO_NOSIGPIPE: {}", .{err}),
+    };
 }
 
 const SO_SNDBUF: u32 = if (builtin.os.tag == .windows)
@@ -2276,7 +2287,7 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
         // wait on a peer that doesn't read. In blocking mode the socket is
         // non-blocking, and a full one just ends the write.
         const timeout = socketTimeout(5);
-        posix.setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout) catch return;
+        setConnectionOption(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout) catch return;
     }
 
     var pos: usize = 0;
@@ -2675,6 +2686,39 @@ test "Server: on Darwin, every socket it accepts has SO_NOSIGPIPE set" {
     var len: posix.socklen_t = @sizeOf(c_int);
     try t.expectEqual(0, std.c.getsockopt(server_socket, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, @ptrCast(&value), &len));
     try t.expectEqual(true, value != 0);
+}
+
+test "setConnectionOption: a socket its peer has already reset is an error on Darwin, not a panic" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var pair = t.SocketPair.init(.{});
+    defer pair.writer.deinit();
+    defer pair.server.close();
+    socket_wait.closeSocket(pair.client.handle, true);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    const timeout = socketTimeout(5);
+    const result = setConnectionOption(pair.server.handle, SOL_SOCKET, SO_SNDTIMEO, &timeout);
+    if (comptime builtin.os.tag.isDarwin()) {
+        try t.expectError(error.ConnectionResetByPeer, result);
+    } else {
+        // Linux sets options on a reset socket without complaint.
+        try result;
+    }
+}
+
+test "preHandOffWrite: a client that has already reset its connection is no panic" {
+    // Darwin fails setsockopt on such a socket with EINVAL. A child, so
+    // that a panic fails the test rather than the test run.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            const pair = t.SocketPair.init(.{});
+            var conn = try testConn(pair.server);
+            socket_wait.closeSocket(pair.client.handle, true);
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            preHandOffWrite(&conn, "HTTP/1.1 400 \r\nConnection: Close\r\n\r\n");
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
 }
 
 test "suppressSigpipe: a socket its peer has already reset is no error" {
