@@ -2593,8 +2593,13 @@ fn runWithDefaultSigpipe(comptime body: fn () anyerror!void) !SigpipeOutcome {
             .flags = 0,
         };
         posix.sigaction(posix.SIG.PIPE, &default, null);
-        body() catch posix.exit(1);
-        posix.exit(0);
+        body() catch |err| {
+            // The parent only sees the exit status.
+            std.debug.print("test child failed: {s}\n", .{@errorName(err)});
+            std.c._exit(1);
+        };
+        // _exit, not exit: the test runner's atexit handlers are the parent's.
+        std.c._exit(0);
     }
     const status = posix.waitpid(pid, 0).status;
     if (posix.W.IFSIGNALED(status)) return .{ .signaled = posix.W.TERMSIG(status) };
@@ -2780,39 +2785,167 @@ test "preHandOffWrite (NonBlocking mode): a client that has already reset its co
     try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
 }
 
-/// Every `posix.setsockopt(` in `source` before its first top-level test,
-/// outside the functions allowed to call it. A source scan: whether a call
-/// can panic depends on the socket, which the compiler can't see.
-fn setsockoptCallsOutside(source: []const u8, comptime allowed: []const []const u8, out: *std.ArrayList(usize)) !void {
-    var function: []const u8 = "";
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    var number: usize = 0;
-    while (lines.next()) |line| {
-        number += 1;
-        if (std.mem.startsWith(u8, line, "test \"")) break;
-        if (std.mem.indexOf(u8, line, "fn ")) |at| {
-            const rest = line[at + 3 ..];
-            if (std.mem.indexOfScalar(u8, rest, '(')) |end| function = rest[0..end];
+/// A `.setsockopt` reference in source: its line, and the innermost named
+/// function it sits in ("" outside any).
+const SetsockoptUse = struct { line: usize, function: []const u8 };
+
+/// Every `.setsockopt` reference in `source` outside test blocks, with the
+/// function it sits in. A source scan over Zig tokens (std.zig.Tokenizer),
+/// so comments and strings are not code, spacing and newlines don't matter,
+/// and any receiver counts: `posix.setsockopt(...)`, `p.setsockopt` after
+/// `const p = std.posix;`, and `= posix.setsockopt;` aliases alike.
+///
+/// The function is tracked by brace depth: a `fn name` opens it at the
+/// first `{` after its parameters that isn't a type's (`error{`, `struct {`,
+/// ...), and it closes with that brace. Test blocks (`test ... { }`) are
+/// skipped the same way, wherever they are in the file.
+///
+/// What it can't see: a name built at comptime (`@field(posix, "setsockopt")`),
+/// a call through a function pointer obtained somewhere else, an
+/// `@"setsockopt"` identifier, or a wrapper in another module (std itself,
+/// or a dependency) that calls setsockopt on our behalf.
+fn findSetsockopt(allocator: std.mem.Allocator, source: [:0]const u8, out: *std.ArrayList(SetsockoptUse)) !void {
+    const Function = struct { name: []const u8, depth: usize };
+    var functions: std.ArrayList(Function) = .empty;
+    defer functions.deinit(allocator);
+
+    var tokenizer = std.zig.Tokenizer.init(source);
+    var depth: usize = 0;
+    var parens: usize = 0;
+    // The depth a test block's closing brace returns to, while inside one.
+    var in_test: ?usize = null;
+    var test_pending = false;
+    // A `fn name` whose body hasn't opened yet, and the paren depth it began at.
+    var pending: ?Function = null;
+    var prev: std.zig.Token.Tag = .invalid;
+    var line: usize = 1;
+    var scanned_to: usize = 0;
+
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) break;
+        defer prev = token.tag;
+        switch (token.tag) {
+            .keyword_test => if (in_test == null) {
+                test_pending = true;
+            },
+            .l_brace => {
+                if (test_pending) {
+                    test_pending = false;
+                    in_test = depth;
+                } else if (pending) |p| if (parens == p.depth and !isTypeBrace(prev)) {
+                    try functions.append(allocator, .{ .name = p.name, .depth = depth });
+                    pending = null;
+                };
+                depth += 1;
+            },
+            .r_brace => {
+                depth -|= 1;
+                if (in_test) |d| if (depth == d) {
+                    in_test = null;
+                };
+                while (functions.items.len > 0 and functions.items[functions.items.len - 1].depth >= depth) _ = functions.pop();
+            },
+            .l_paren => parens += 1,
+            .r_paren => parens -|= 1,
+            // A prototype (`extern fn x() void;`) or a function type: no body.
+            .semicolon => if (pending) |p| if (parens == p.depth) {
+                pending = null;
+            },
+            .identifier => {
+                const name = source[token.loc.start..token.loc.end];
+                if (prev == .keyword_fn) {
+                    pending = .{ .name = name, .depth = parens };
+                } else if (prev == .period and in_test == null and std.mem.eql(u8, name, "setsockopt")) {
+                    line += std.mem.count(u8, source[scanned_to..token.loc.start], "\n");
+                    scanned_to = token.loc.start;
+                    const function = if (functions.items.len > 0) functions.items[functions.items.len - 1].name else "";
+                    try out.append(allocator, .{ .line = line, .function = function });
+                }
+            },
+            else => {},
         }
-        if (std.mem.indexOf(u8, line, "posix.setsockopt(") == null) continue;
-        const ok = for (allowed) |name| {
-            if (std.mem.eql(u8, function, name)) break true;
-        } else false;
-        if (!ok) try out.append(t.allocator, number);
     }
 }
 
+fn isTypeBrace(prev: std.zig.Token.Tag) bool {
+    return switch (prev) {
+        .keyword_error, .keyword_struct, .keyword_enum, .keyword_union, .keyword_opaque => true,
+        else => false,
+    };
+}
+
+test "findSetsockopt: finds every spelling outside test blocks and knows its function" {
+    const source =
+        \\const std = @import("std");
+        \\const p = std.posix;
+        \\const alias = p.setsockopt;
+        \\test "first" {
+        \\    p.setsockopt(1, 2, 3, "");
+        \\}
+        \\fn afterTest() error{A}!void {
+        \\    // p.setsockopt( in a comment
+        \\    const s = "p.setsockopt(";
+        \\    _ = s;
+        \\    std.posix
+        \\        . setsockopt (1, 2, 3, "");
+        \\}
+        \\const top = 1; // fn notAFunction() {
+        \\const T = struct {
+        \\    fn method() void {
+        \\        _ = std.posix.system.setsockopt;
+        \\    }
+        \\};
+        \\fn allowed() void {
+        \\    p.setsockopt(1, 2, 3, "");
+        \\}
+    ;
+    var found: std.ArrayList(SetsockoptUse) = .empty;
+    defer found.deinit(std.testing.allocator);
+    try findSetsockopt(std.testing.allocator, source, &found);
+    try std.testing.expectEqual(4, found.items.len);
+    try std.testing.expectEqual(3, found.items[0].line);
+    try std.testing.expectEqualStrings("", found.items[0].function);
+    try std.testing.expectEqual(12, found.items[1].line);
+    try std.testing.expectEqualStrings("afterTest", found.items[1].function);
+    try std.testing.expectEqual(17, found.items[2].line);
+    try std.testing.expectEqualStrings("method", found.items[2].function);
+    try std.testing.expectEqual(21, found.items[3].line);
+    try std.testing.expectEqualStrings("allowed", found.items[3].function);
+}
+
+/// Where `.setsockopt` may appear in websocket.zig's server, outside tests.
+const allowed_setsockopt = [_]struct { file: []const u8, function: []const u8 }{
+    // The listener, before any connection exists.
+    .{ .file = "server.zig", .function = "listen" },
+    // The one place connection sockets get options.
+    .{ .file = "server.zig", .function = "setConnectionOption" },
+    // Raw calls (errors ignored), made because posix.setsockopt panics.
+    .{ .file = "socket_wait.zig", .function = "closeSocket" },
+    // Test helpers, on test sockets.
+    .{ .file = "server.zig", .function = "testStream" },
+    .{ .file = "server.zig", .function = "setSendBuffer" },
+};
+
 test "lint: connection sockets get options only through setConnectionOption" {
     // posix.setsockopt panics on Darwin when a client has reset the
-    // connection. Only the listener (in listen) may use it, and
-    // setConnectionOption itself on Windows.
-    var found: std.ArrayList(usize) = .empty;
-    defer found.deinit(t.allocator);
-    try setsockoptCallsOutside(@embedFile("server.zig"), &.{ "listen", "setConnectionOption" }, &found);
-    if (found.items.len > 0) {
-        std.debug.print("posix.setsockopt outside listen/setConnectionOption in server.zig, lines {any}\n", .{found.items});
-        return error.SetsockoptOnConnection;
+    // connection, so outside the places above `.setsockopt` may not appear.
+    const files = .{ "server.zig", "socket_wait.zig", "handshake.zig", "thread_pool.zig", "fallback_allocator.zig" };
+    var failed = false;
+    inline for (files) |file| {
+        var found: std.ArrayList(SetsockoptUse) = .empty;
+        defer found.deinit(t.allocator);
+        try findSetsockopt(t.allocator, @embedFile(file), &found);
+        for (found.items) |use| {
+            const ok = for (allowed_setsockopt) |a| {
+                if (std.mem.eql(u8, a.file, file) and std.mem.eql(u8, a.function, use.function)) break true;
+            } else false;
+            if (ok) continue;
+            std.debug.print("setsockopt outside setConnectionOption: src/server/{s}:{d} (in fn {s})\n", .{ file, use.line, if (use.function.len > 0) use.function else "<none>" });
+            failed = true;
+        }
     }
+    if (failed) return error.SetsockoptOnConnection;
 }
 
 test "suppressSigpipe: a socket its peer has already reset is no error" {
