@@ -1719,17 +1719,19 @@ pub const Conn = struct {
     }
 
     /// One non-blocking send of `vec` (POSIX only) that never raises SIGPIPE.
-    /// A send to a peer that has gone away raises SIGPIPE unless told not to,
-    /// and its default action ends the process: in an application that is a
-    /// plugin, its host. Whether the host catches SIGPIPE isn't the library's
-    /// to know, and a handler installed for it can be replaced by anything
-    /// else in the process, so every send passes MSG_NOSIGNAL and a dead peer
-    /// is just error.BrokenPipe. (writev() takes no flags.) Darwin sockets
-    /// also get SO_NOSIGPIPE when accepted (`suppressSigpipe`).
+    /// A send to a peer that has gone away raises SIGPIPE unless the call
+    /// passes MSG_NOSIGNAL, and SIGPIPE's default action ends the process:
+    /// when the application is a plugin, its host. Whether the host catches
+    /// SIGPIPE isn't the library's to know, and a handler installed for it
+    /// can be replaced by anything else in the process. So every send passes
+    /// MSG_NOSIGNAL, through sendmsg (writev() takes no flags), and a dead
+    /// peer is just error.BrokenPipe. Darwin sockets also get SO_NOSIGPIPE
+    /// when accepted (`suppressSigpipe`).
     ///
-    /// The errno mapping is posix.sendmsg's, except that a descriptor closed
-    /// under a racing send (see writeAllIOVecLocked) is an error, not
-    /// unreachable, as posix.writev has it.
+    /// The errno mapping is posix.sendmsg's, except for EBADF and ENOTSOCK,
+    /// which posix.sendmsg treats as unreachable: here they are errors (as
+    /// posix.writev has EBADF), since a send can race the connection's close
+    /// (see writeAllIOVecLocked).
     fn sendVec(socket: net.Stream.Handle, vec: []const posix.iovec_const) SendError!usize {
         comptime std.debug.assert(builtin.os.tag != .windows);
         const msg: posix.msghdr_const = .{
@@ -2643,6 +2645,36 @@ test "suppressSigpipe: on Darwin even a plain write to a closed peer fails inste
         }
     }.body);
     try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+/// The server's end of the connection `client` made to it: the descriptor
+/// in this process whose peer address is the client's own address.
+fn serverSocketOf(client: posix.socket_t) !posix.socket_t {
+    var local: posix.sockaddr.storage = undefined;
+    var local_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    if (std.c.getsockname(client, @ptrCast(&local), &local_len) != 0) return error.GetSockName;
+    var fd: posix.socket_t = 0;
+    while (fd < 4096) : (fd += 1) {
+        if (fd == client) continue;
+        var peer: posix.sockaddr.storage = undefined;
+        var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        // Raw: posix.getpeername treats a descriptor that isn't open as unreachable.
+        if (std.c.getpeername(fd, @ptrCast(&peer), &peer_len) != 0) continue;
+        if (peer_len == local_len and std.mem.eql(u8, std.mem.asBytes(&peer)[0..peer_len], std.mem.asBytes(&local)[0..local_len])) return fd;
+    }
+    return error.ServerSocketNotFound;
+}
+
+test "Server: on Darwin, every socket it accepts has SO_NOSIGPIPE set" {
+    // Through the real accept path (Blocking or NonBlocking, by build mode).
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const stream = try testStream(true);
+    defer stream.close();
+    const server_socket = try serverSocketOf(stream.handle);
+    var value: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    try t.expectEqual(0, std.c.getsockopt(server_socket, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, @ptrCast(&value), &len));
+    try t.expectEqual(true, value != 0);
 }
 
 test "suppressSigpipe: a socket its peer has already reset is no error" {
