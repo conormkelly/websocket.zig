@@ -38,6 +38,39 @@ fn socketTimeout(sec: u32) SocketTimeout {
     return std.mem.toBytes(posix.timeval{ .sec = @intCast(sec), .usec = 0 });
 }
 
+/// What a send to a connection's socket can fail with (Conn.sendSome).
+const SendError = error{
+    WouldBlock,
+    BrokenPipe,
+    ConnectionResetByPeer,
+    SocketNotConnected,
+    SystemResources,
+    NotOpenForWriting,
+    FileDescriptorNotASocket,
+    Unexpected,
+};
+
+/// Darwin: a write to a dead peer on this socket fails with EPIPE instead of
+/// raising SIGPIPE, whatever call makes it. Conn's sends already pass
+/// MSG_NOSIGNAL; this also covers any write that doesn't, and kernels that
+/// ignore the flag. Best effort for the same reason. Other systems have no
+/// such option (Linux) or no SIGPIPE (Windows).
+///
+/// Not posix.setsockopt: Darwin fails any setsockopt on a socket whose peer
+/// has already reset it with EINVAL, which posix.setsockopt treats as
+/// unreachable. A client can do that before its connection is accepted.
+fn suppressSigpipe(socket: posix.socket_t) void {
+    if (comptime !builtin.os.tag.isDarwin()) return;
+    const one: c_int = 1;
+    const rc = posix.system.setsockopt(socket, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        // Already reset: the next read ends the connection.
+        .INVAL => {},
+        else => |err| log.warn("failed to set SO_NOSIGPIPE: {}", .{err}),
+    }
+}
+
 const SO_SNDBUF: u32 = if (builtin.os.tag == .windows)
     @intCast(std.os.windows.ws2_32.SO.SNDBUF)
 else
@@ -448,6 +481,7 @@ pub fn Blocking(comptime H: type) type {
                     },
                 };
                 log.debug("({f}) connected", .{address});
+                suppressSigpipe(socket);
 
                 self.threads_mut.lock();
                 self.threads += 1;
@@ -721,6 +755,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
                 };
 
                 log.debug("({f}) connected", .{address});
+                suppressSigpipe(socket);
 
                 {
                     errdefer posix.close(socket);
@@ -1666,8 +1701,8 @@ pub const Conn = struct {
     }
 
     /// One non-blocking send. Windows uses send(): posix.write goes through
-    /// WriteFile, which fails on sockets in Zig 0.15.
-    fn sendSome(socket: net.Stream.Handle, data: []const u8) !usize {
+    /// WriteFile, which fails on sockets in Zig 0.15. Elsewhere see sendVec.
+    fn sendSome(socket: net.Stream.Handle, data: []const u8) SendError!usize {
         if (builtin.os.tag == .windows) {
             const ws2 = std.os.windows.ws2_32;
             const rc = ws2.send(socket, data.ptr, @intCast(data.len), 0);
@@ -1680,7 +1715,47 @@ pub const Conn = struct {
             }
             return @intCast(rc);
         }
-        return std.posix.write(socket, data);
+        return sendVec(socket, &.{.{ .base = data.ptr, .len = data.len }});
+    }
+
+    /// One non-blocking send of `vec` (POSIX only) that never raises SIGPIPE.
+    /// A send to a peer that has gone away raises SIGPIPE unless told not to,
+    /// and its default action ends the process: in an application that is a
+    /// plugin, its host. Whether the host catches SIGPIPE isn't the library's
+    /// to know, and a handler installed for it can be replaced by anything
+    /// else in the process, so every send passes MSG_NOSIGNAL and a dead peer
+    /// is just error.BrokenPipe. (writev() takes no flags.) Darwin sockets
+    /// also get SO_NOSIGPIPE when accepted (`suppressSigpipe`).
+    ///
+    /// The errno mapping is posix.sendmsg's, except that a descriptor closed
+    /// under a racing send (see writeAllIOVecLocked) is an error, not
+    /// unreachable, as posix.writev has it.
+    fn sendVec(socket: net.Stream.Handle, vec: []const posix.iovec_const) SendError!usize {
+        comptime std.debug.assert(builtin.os.tag != .windows);
+        const msg: posix.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = vec.ptr,
+            .iovlen = @intCast(@min(vec.len, posix.IOV_MAX)),
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        while (true) {
+            const rc = posix.system.sendmsg(socket, &msg, posix.MSG.NOSIGNAL);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .NOTCONN => return error.SocketNotConnected,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                .BADF => return error.NotOpenForWriting,
+                .NOTSOCK => return error.FileDescriptorNotASocket,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        }
     }
 
     /// Queue what is left of `vec` behind a full socket, or give up on a peer
@@ -1750,7 +1825,7 @@ pub const Conn = struct {
                     else => return err,
                 }
             else
-                std.posix.writev(self.stream.handle, vec[i..]) catch |err| switch (err) {
+                sendVec(self.stream.handle, vec[i..]) catch |err| switch (err) {
                     error.WouldBlock => return self.queueLocked(vec[i..]),
                     else => return err,
                 };
@@ -2205,11 +2280,7 @@ fn preHandOffWrite(conn: *Conn, response: []const u8) void {
     var pos: usize = 0;
     while (pos < response.len) {
         const remaining = response[pos..];
-        const n: usize = if (builtin.os.tag == .windows) blk: {
-            const rc = std.os.windows.ws2_32.send(socket, remaining.ptr, @intCast(remaining.len), 0);
-            if (rc == std.os.windows.ws2_32.SOCKET_ERROR) return;
-            break :blk @intCast(rc);
-        } else posix.write(socket, remaining) catch return;
+        const n = Conn.sendSome(socket, remaining) catch return;
         if (n == 0) {
             // closed
             return;
@@ -2473,6 +2544,116 @@ test "Conn: close" {
         _ = try testRecvAtLeast(stream, &buf, 7);
         try t.expectSlice(u8, &.{ 136, 5, 0, 0xea, 'b', 'y', 'e' }, buf[0..7]);
     }
+}
+
+// The SIGPIPE tests fork, and in the child put SIGPIPE back to its default
+// action (terminate), as in a host process that doesn't catch it: the test
+// runner is an executable, whose start code catches SIGPIPE.
+const SigpipeOutcome = union(enum) { exited: u8, signaled: u32 };
+
+fn runWithDefaultSigpipe(comptime body: fn () anyerror!void) !SigpipeOutcome {
+    const pid = try posix.fork();
+    if (pid == 0) {
+        const default: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.DFL },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.PIPE, &default, null);
+        body() catch posix.exit(1);
+        posix.exit(0);
+    }
+    const status = posix.waitpid(pid, 0).status;
+    if (posix.W.IFSIGNALED(status)) return .{ .signaled = posix.W.TERMSIG(status) };
+    return .{ .exited = posix.W.EXITSTATUS(status) };
+}
+
+/// Sends to a peer that has closed its socket until one fails. The first
+/// can still succeed: the peer's reset is the answer to it.
+fn sendUntilRefused(comptime send: fn (socket: posix.socket_t) anyerror!void) !void {
+    var pair = t.SocketPair.init(.{});
+    pair.client.close();
+    for (0..200) |_| {
+        send(pair.server.handle) catch return;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    return error.SendsKeptSucceeding;
+}
+
+test "a plain write to a closed peer is killed by SIGPIPE under the default action" {
+    // What the tests below guard against, so they can't pass by never
+    // reaching it.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            try sendUntilRefused(struct {
+                fn send(socket: posix.socket_t) !void {
+                    _ = try posix.write(socket, "after the peer left");
+                }
+            }.send);
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .signaled = posix.SIG.PIPE }, outcome);
+}
+
+test "Conn: frames written to a closed peer fail instead of raising SIGPIPE" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            var pair = t.SocketPair.init(.{});
+            var conn = try testConn(pair.server);
+            pair.client.close();
+            for (0..200) |_| {
+                conn.writeText("after the peer left") catch return;
+                std.Thread.sleep(std.time.ns_per_ms);
+            }
+            return error.SendsKeptSucceeding;
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+test "Conn: a send to a closed peer fails instead of raising SIGPIPE" {
+    // sendSome: queued output and handshake responses.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            try sendUntilRefused(struct {
+                fn send(socket: posix.socket_t) !void {
+                    _ = try Conn.sendSome(socket, "after the peer left");
+                }
+            }.send);
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+test "suppressSigpipe: on Darwin even a plain write to a closed peer fails instead of raising SIGPIPE" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const outcome = try runWithDefaultSigpipe(struct {
+        fn body() !void {
+            var pair = t.SocketPair.init(.{});
+            suppressSigpipe(pair.server.handle);
+            pair.client.close();
+            for (0..200) |_| {
+                _ = posix.write(pair.server.handle, "after the peer left") catch return;
+                std.Thread.sleep(std.time.ns_per_ms);
+            }
+            return error.SendsKeptSucceeding;
+        }
+    }.body);
+    try t.expectEqual(SigpipeOutcome{ .exited = 0 }, outcome);
+}
+
+test "suppressSigpipe: a socket its peer has already reset is no error" {
+    // As when a client gives up before its connection is accepted.
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    var pair = t.SocketPair.init(.{});
+    defer pair.writer.deinit();
+    defer pair.server.close();
+    socket_wait.closeSocket(pair.client.handle, true);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    suppressSigpipe(pair.server.handle);
 }
 
 test "Server: a handler's handshakeErrorResponse is what a refused upgrade gets" {
