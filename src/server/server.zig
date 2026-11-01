@@ -1728,10 +1728,13 @@ pub const Conn = struct {
     /// peer is just error.BrokenPipe. Darwin sockets also get SO_NOSIGPIPE
     /// when accepted (`suppressSigpipe`).
     ///
-    /// The errno mapping is posix.sendmsg's, except for EBADF and ENOTSOCK,
-    /// which posix.sendmsg treats as unreachable: here they are errors (as
-    /// posix.writev has EBADF), since a send can race the connection's close
-    /// (see writeAllIOVecLocked).
+    /// Errors: EAGAIN is WouldBlock, EPIPE BrokenPipe, ECONNRESET
+    /// ConnectionResetByPeer, ENOTCONN SocketNotConnected, ENOBUFS and ENOMEM
+    /// SystemResources, EBADF NotOpenForWriting (a send can race the
+    /// connection's close; see writeAllIOVecLocked) and ENOTSOCK
+    /// FileDescriptorNotASocket. Every other errno is error.Unexpected:
+    /// nothing is unreachable, unlike posix.sendmsg, which treats EBADF,
+    /// ENOTSOCK, EINVAL, EFAULT and EOPNOTSUPP as unreachable.
     fn sendVec(socket: net.Stream.Handle, vec: []const posix.iovec_const) SendError!usize {
         comptime std.debug.assert(builtin.os.tag != .windows);
         const msg: posix.msghdr_const = .{
